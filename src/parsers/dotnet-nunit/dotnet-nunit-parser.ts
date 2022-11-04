@@ -2,8 +2,7 @@ import * as path from 'path'
 import {ParseOptions, TestParser} from '../../test-parser'
 import {parseStringPromise} from 'xml2js'
 
-import {DEFAULT_LOCALE} from '../../utils/node-utils'
-import {JunitReport, SingleSuiteReport, TestCase, TestSuite} from './java-junit-types'
+import {NunitReport, TestCase, TestSuite} from './dotnet-nunit-types'
 import {normalizeFilePath} from '../../utils/path-utils'
 
 import {
@@ -15,11 +14,10 @@ import {
   TestCaseError
 } from '../../test-results'
 
-export class JavaJunitParser implements TestParser {
+export class DotnetNunitParser implements TestParser {
   readonly trackedFiles: {[fileName: string]: string[]}
 
   constructor(readonly options: ParseOptions) {
-    // Map to efficient lookup of all paths with given file name
     this.trackedFiles = {}
     for (const filePath of options.trackedFiles) {
       const fileName = path.basename(filePath)
@@ -29,30 +27,11 @@ export class JavaJunitParser implements TestParser {
   }
 
   async parse(filePath: string, content: string): Promise<TestRunResult> {
-    const reportOrSuite = await this.getJunitReport(filePath, content)
-    const isReport = (reportOrSuite as JunitReport).testsuites !== undefined
-
-    // XML might contain:
-    // - multiple suites under <testsuites> root node
-    // - single <testsuite> as root node
-    let ju: JunitReport
-    if (isReport) {
-      ju = reportOrSuite as JunitReport
-    } else {
-      // Make it behave the same way as if suite was inside <testsuites> root node
-      const suite = (reportOrSuite as SingleSuiteReport).testsuite
-      ju = {
-        testsuites: {
-          $: {time: suite.$.time},
-          testsuite: [suite]
-        }
-      }
-    }
-
-    return this.getTestRunResult(filePath, ju)
+    const reportOrSuite = await this.getNunitReport(filePath, content)
+    return this.getTestRunResult(filePath, reportOrSuite)
   }
 
-  private async getJunitReport(filePath: string, content: string): Promise<JunitReport | SingleSuiteReport> {
+  private async getNunitReport(filePath: string, content: string): Promise<NunitReport> {
     try {
       return await parseStringPromise(content)
     } catch (e) {
@@ -60,38 +39,49 @@ export class JavaJunitParser implements TestParser {
     }
   }
 
-  private getTestRunResult(filePath: string, junit: JunitReport): TestRunResult {
-    const suites =
-      junit.testsuites.testsuite === undefined
-        ? []
-        : junit.testsuites.testsuite.map(ts => {
-            const name = ts.$.name.trim()
-            const time = parseFloat(ts.$.time) * 1000
-            const sr = new TestSuiteResult(name, this.getGroups(ts), time)
-            return sr
-          })
+  private getTestSuiteResultRecursive(
+    testSuites: TestSuite[] | undefined,
+    suiteResults: TestSuiteResult[],
+    depth: number
+  ): void {
+    if (testSuites !== undefined) {
+      testSuites.map(ts => {
+        const name = ts.$.name.trim()
+        const time = parseFloat(ts.$.duration) * 1000
+        const groups = this.getGroups(ts)
+        const sr = new TestSuiteResult(name, groups, time, depth)
+        suiteResults.push(sr)
 
-    suites.sort((a, b) => a.name.localeCompare(b.name, DEFAULT_LOCALE))
+        if (groups.length === 0) {
+          const nestedTestSuites = ts['test-suite']
+          if (nestedTestSuites !== undefined) {
+            this.getTestSuiteResultRecursive(nestedTestSuites, suiteResults, depth + 1)
+          }
+        }
+      })
+    }
+  }
 
-    const seconds = parseFloat(junit.testsuites.$?.time)
+  private getTestRunResult(filePath: string, nunit: NunitReport): TestRunResult {
+    const suites: TestSuiteResult[] = []
+
+    const testSuites = nunit['test-run']['test-suite']
+    this.getTestSuiteResultRecursive(testSuites, suites, 0)
+
+    const seconds = parseFloat(nunit['test-run'].$?.time)
     const time = isNaN(seconds) ? undefined : seconds * 1000
     return new TestRunResult(filePath, suites, time)
   }
 
   private getGroups(suite: TestSuite): TestGroupResult[] {
-    if (suite.testcase === undefined) {
+    const groups: {describe: string; tests: TestCase[]}[] = []
+    if (suite['test-case'] === undefined) {
       return []
     }
-
-    const groups: {name: string; tests: TestCase[]}[] = []
-    for (const tc of suite.testcase) {
-      // Normally classname is same as suite name - both refer to same Java class
-      // Therefore it doesn't make sense to process it as a group
-      // and tests will be added to default group with empty name
-      const className = tc.$.classname === suite.$.name ? '' : tc.$.classname
-      let grp = groups.find(g => g.name === className)
+    for (const tc of suite['test-case']) {
+      let grp = groups.find(g => g.describe === tc.$.classname)
       if (grp === undefined) {
-        grp = {name: className, tests: []}
+        grp = {describe: tc.$.classname, tests: []}
         groups.push(grp)
       }
       grp.tests.push(tc)
@@ -101,17 +91,16 @@ export class JavaJunitParser implements TestParser {
       const tests = grp.tests.map(tc => {
         const name = tc.$.name.trim()
         const result = this.getTestCaseResult(tc)
-        const time = parseFloat(tc.$.time) * 1000
-        const error = this.getTestCaseError(tc)
-        return new TestCaseResult(name, result, time, error)
+        const time = parseFloat(tc.$.duration) * 1000
+        return new TestCaseResult(name, result, time, undefined)
       })
-      return new TestGroupResult(grp.name, tests)
+      return new TestGroupResult(grp.describe, tests)
     })
   }
 
   private getTestCaseResult(test: TestCase): TestExecutionResult {
-    if (test.failure || test.error) return 'failed'
-    if (test.skipped) return 'skipped'
+    if (test.failure) return 'failed'
+    if (test.$.result === 'Skipped') return 'skipped'
     return 'success'
   }
 
@@ -121,13 +110,12 @@ export class JavaJunitParser implements TestParser {
     }
 
     // We process <error> and <failure> the same way
-    const failures = tc.failure ?? tc.error
-    if (!failures) {
+    const failure = tc.failure
+    if (!failure) {
       return undefined
     }
 
-    const failure = failures[0]
-    const details = typeof failure === 'object' ? failure._ : failure
+    const details = typeof failure === 'object' ? failure['stack-trace'] : failure
     let filePath
     let line
 
