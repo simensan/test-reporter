@@ -25,16 +25,15 @@ export interface TestSuite {
 
 export interface TestCase {
   $: {
-    classname: string
-    file?: string
+    fullname: string
     name: string
-    duration: string
+    time: string
     result: string
   }
-  failure?: Failure
+  failure?: Failure[]
 }
 
 export interface Failure {
-  'stack-trace': string
+  'stack-trace'?: string
   message: string
 }

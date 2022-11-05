@@ -79,9 +79,9 @@ export class DotnetNunitParser implements TestParser {
       return []
     }
     for (const tc of suite['test-case']) {
-      let grp = groups.find(g => g.describe === tc.$.classname)
+      let grp = groups.find(g => g.describe === tc.$.name)
       if (grp === undefined) {
-        grp = {describe: tc.$.classname, tests: []}
+        grp = {describe: tc.$.name, tests: []}
         groups.push(grp)
       }
       grp.tests.push(tc)
@@ -91,8 +91,9 @@ export class DotnetNunitParser implements TestParser {
       const tests = grp.tests.map(tc => {
         const name = tc.$.name.trim()
         const result = this.getTestCaseResult(tc)
-        const time = parseFloat(tc.$.duration) * 1000
-        return new TestCaseResult(name, result, time, undefined)
+        const time = parseFloat(tc.$.time) * 1000
+        const error = this.getTestCaseError(tc)
+        return new TestCaseResult(name, result, time, error)
       })
       return new TestGroupResult(grp.describe, tests)
     })
@@ -109,13 +110,13 @@ export class DotnetNunitParser implements TestParser {
       return undefined
     }
 
-    // We process <error> and <failure> the same way
     const failure = tc.failure
     if (!failure) {
       return undefined
     }
 
-    const details = typeof failure === 'object' ? failure['stack-trace'] : failure
+    const details = failure[0]['stack-trace'] === undefined ? '' : failure[0]['stack-trace'][0]
+
     let filePath
     let line
 
@@ -129,69 +130,21 @@ export class DotnetNunitParser implements TestParser {
       path: filePath,
       line,
       details,
-      message: typeof failure === 'object' ? failure.message : undefined
+      message: failure[0].message === undefined ? '' : failure[0].message[0]
     }
   }
 
   private exceptionThrowSource(stackTrace: string): {filePath: string; line: number} | undefined {
     const lines = stackTrace.split(/\r?\n/)
-    const re = /^at (.*)\((.*):(\d+)\)$/
+    const re = /^at (.*\) in .*):(.+)$/
 
     for (const str of lines) {
       const match = str.match(re)
       if (match !== null) {
-        const [_, tracePath, fileName, lineStr] = match
-        const filePath = this.getFilePath(tracePath, fileName)
-        if (filePath !== undefined) {
-          const line = parseInt(lineStr)
-          return {filePath, line}
-        }
+        const [, , filePath, lineStr] = match
+        const line = parseInt(lineStr)
+        return {filePath, line}
       }
     }
-  }
-
-  // Stacktrace in Java doesn't contain full paths to source file.
-  // There are only package, file name and line.
-  // Assuming folder structure matches package name (as it should in Java),
-  // we can try to match tracked file.
-  private getFilePath(tracePath: string, fileName: string): string | undefined {
-    // Check if there is any tracked file with given name
-    const files = this.trackedFiles[fileName]
-    if (files === undefined) {
-      return undefined
-    }
-
-    // Remove class name and method name from trace.
-    // Take parts until first item with capital letter - package names are lowercase while class name is CamelCase.
-    const packageParts = tracePath.split(/\./g)
-    const packageIndex = packageParts.findIndex(part => part[0] <= 'Z')
-    if (packageIndex !== -1) {
-      packageParts.splice(packageIndex, packageParts.length - packageIndex)
-    }
-
-    if (packageParts.length === 0) {
-      return undefined
-    }
-
-    // Get right file
-    // - file name matches
-    // - parent folders structure must reflect the package name
-    for (const filePath of files) {
-      const dirs = path.dirname(filePath).split(/\//g)
-      if (packageParts.length > dirs.length) {
-        continue
-      }
-      // get only N parent folders, where N = length of package name parts
-      if (dirs.length > packageParts.length) {
-        dirs.splice(0, dirs.length - packageParts.length)
-      }
-      // check if parent folder structure matches package name
-      const isMatch = packageParts.every((part, i) => part === dirs[i])
-      if (isMatch) {
-        return filePath
-      }
-    }
-
-    return undefined
   }
 }
